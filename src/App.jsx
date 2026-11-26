@@ -1,5 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import TicketPage from './TicketPage';
+import { useTicketPrinter } from './TicketPrinter';
+import PrinterButton from './PrinterButton';
+import { formatKitchenTicket } from './kitchenTicket';
+import { renderReceipt, resolveReceiptTemplate } from './receiptTemplate';
 import {
+  acceptOldestOrder,
+  acceptOrder,
+  advanceOrderStatus,
   clearSession,
   createOrder,
   createMenu,
@@ -9,23 +17,27 @@ import {
   deleteRestaurantUser,
   deleteUser,
   deleteMenuItem,
+  deleteOrder,
+  editOrderItems,
   getAccessToken,
   getCashRegister,
   getCurrentUser,
   getMenu,
   getMenus,
+  getOrder,
   getOrders,
   getRestaurants,
+  getTicketTemplate,
   getRestaurantUsers,
   getUsers,
   login,
   openCashRegister,
   closeCashRegister,
   payTableOrders,
+  registerKitchenReprint,
   saveMenuItem,
   updateRestaurantUser,
   updateUser,
-  updateOrder,
 } from './api';
 
 const money = (value) => `$${new Intl.NumberFormat('es-CL').format(value)}`;
@@ -37,6 +49,7 @@ const icons = {
   orders: <><path d="M4 4h16v16H4z" /><path d="M8 9h8M8 13h8M8 17h4" /></>,
   business: <><path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-4" /><path d="M8 9v.01M8 12v.01M8 15v.01M16 14v.01M16 17v.01" /></>,
   users: <><circle cx="9" cy="8" r="3" /><path d="M3 20v-1a6 6 0 0 1 12 0v1M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.6v1" /></>,
+  printer: <><path d="M6 9V3h12v6M6 17H4V9h16v8h-2M6 14h12v7H6z" /><path d="M17 11h.01" /></>,
   search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
   plus: <><path d="M12 5v14M5 12h14" /></>,
   edit: <><path d="m15 5 4 4M4 20l4-.8L19 8a2.1 2.1 0 0 0-3-3L5 16z" /></>,
@@ -62,6 +75,7 @@ const navItems = [
   { id: 'business', label: 'Gestión de negocio', icon: 'business' },
   { id: 'staff', label: 'Garzones', icon: 'users' },
   { id: 'master', label: 'Restaurantes y usuarios', icon: 'users' },
+  { id: 'tickets', label: 'Impresión de tickets', icon: 'printer' },
 ];
 
 const roleLabels = {
@@ -104,27 +118,90 @@ function App() {
   const [category, setCategory] = useState('Todos');
   const [modalItem, setModalItem] = useState(null);
   const [orderModalOpen, setOrderModalOpen] = useState(false);
+  const [editingOrder, setEditingOrder] = useState(null);
   const [paymentConfirmationGroup, setPaymentConfirmationGroup] = useState(null);
+  const [paymentLoadError, setPaymentLoadError] = useState('');
+  const [receiptError, setReceiptError] = useState('');
+  const [tableActionPending, setTableActionPending] = useState(false);
+  const tableActionPendingRef = useRef(false);
   const [cashRegister, setCashRegister] = useState(null);
   const [cashModalOpen, setCashModalOpen] = useState(false);
   const [cashVisible, setCashVisible] = useState(() => localStorage.getItem('mesalista.cashVisible') !== 'false');
   const [toast, setToast] = useState('');
+  const [pendingOrderIds, setPendingOrderIds] = useState([]);
+  const [countdown, setCountdown] = useState({ restaurantId: null, durationMs: 60000, remainingMs: 60000, deadline: null, editValue: null });
+  const [countdownBusy, setCountdownBusy] = useState(false);
+  const [countdownError, setCountdownError] = useState('');
+  const pendingOrderIdsRef = useRef(new Set());
+  const { printTicket, printableTicket, usb } = useTicketPrinter();
   const ordersRefreshInProgress = useRef(false);
   const ordersPollingError = useRef(false);
+  const ordersMutationVersion = useRef(0);
   const isMaster = user?.rol === 'ADMINISTRADOR_MASTER';
   const canManageStaff = user?.rol === 'ADMINISTRADOR';
   const canManageMenu = ['ADMINISTRADOR_MASTER', 'ADMINISTRADOR', 'RESTAURANTE'].includes(user?.rol);
+  const canManageTickets = canManageMenu;
   const canCreateOrders = ['ADMINISTRADOR_MASTER', 'ADMINISTRADOR', 'RESTAURANTE', 'GARZON'].includes(user?.rol);
   const canViewBusiness = canManageMenu;
   const restaurantId = user?.idRestaurante ?? selectedRestaurantId;
+  const restaurantIdRef = useRef(restaurantId);
+  restaurantIdRef.current = restaurantId;
   const restaurant = restaurants.find((item) => item.idRestaurante === restaurantId);
   const visibleNavItems = navItems.filter((item) =>
     (item.id !== 'menu' || canManageMenu) &&
     (item.id !== 'business' || canViewBusiness) &&
     (item.id !== 'staff' || canManageStaff) &&
+    (item.id !== 'tickets' || canManageTickets) &&
     (item.id !== 'master' || isMaster),
   );
   const orderTotal = orders.reduce((total, order) => total + order.total, 0);
+
+  useEffect(() => {
+    setReceiptError('');
+    setCountdown({ restaurantId, durationMs: 60000, remainingMs: 60000, deadline: null, editValue: null });
+    setCountdownBusy(false);
+    setCountdownError('');
+    setEditingOrder(null);
+  }, [restaurantId]);
+
+  useEffect(() => {
+    if (!user || restaurantId == null || countdown.restaurantId !== restaurantId || countdown.deadline === null) return undefined;
+    let active = true;
+    const deadline = countdown.deadline;
+    const timer = window.setTimeout(async () => {
+      if (!active) return;
+      setCountdownBusy(true);
+      setCountdownError('');
+      try {
+        const accepted = await acceptOldestOrder(restaurantId);
+        if (!active) return;
+        if (accepted) {
+          ordersMutationVersion.current += 1;
+          setOrders((current) => current.some((order) => order.id === accepted.id)
+            ? current.map((order) => order.id === accepted.id ? accepted : order)
+            : [accepted, ...current]);
+          const nextDeadline = Date.now() + countdown.durationMs;
+          printKitchenTicket(accepted, true);
+          if (!active) return;
+          setCountdown((current) => ({ ...current, deadline: nextDeadline, remainingMs: current.durationMs }));
+        } else {
+          setCountdown((current) => ({ ...current, deadline: null, remainingMs: 0 }));
+          setToast('No hay pedidos nuevos. El temporizador se detuvo.');
+        }
+      } catch (error) {
+        if (active) {
+          setCountdown((current) => ({ ...current, deadline: null, remainingMs: 0 }));
+          setCountdownError(`No se pudo confirmar la aceptación automática: ${error.message}. Revisa los pedidos antes de reiniciar.`);
+        }
+      } finally {
+        if (active) setCountdownBusy(false);
+      }
+    }, Math.max(0, deadline - Date.now()));
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [countdown.deadline, countdown.restaurantId, restaurantId, user]);
 
   useEffect(() => {
     let active = true;
@@ -255,12 +332,13 @@ function App() {
     setOrderItems([]);
     setSelectedMenuId(null);
     const menuRequest = canCreateOrders ? getMenus(restaurantId) : Promise.resolve([]);
+    const version = ordersMutationVersion.current;
     Promise.all([menuRequest, getOrders(restaurantId)])
       .then(([menuList, orderList]) => {
         if (!active) return;
         setMenus(menuList);
         setSelectedMenuId(null);
-        setOrders(orderList);
+        if (ordersMutationVersion.current === version) setOrders(orderList);
       })
       .catch((error) => {
         if (active) setToast(`No se pudieron cargar los datos: ${error.message}`);
@@ -325,10 +403,11 @@ function App() {
     const timer = window.setInterval(async () => {
       if (!active || document.visibilityState !== 'visible' || ordersRefreshInProgress.current) return;
       ordersRefreshInProgress.current = true;
+      const version = ordersMutationVersion.current;
       try {
         const latestOrders = await getOrders(restaurantId);
         if (active) {
-          setOrders(latestOrders);
+          if (ordersMutationVersion.current === version) setOrders(latestOrders);
           ordersPollingError.current = false;
         }
       } catch (error) {
@@ -489,19 +568,171 @@ function App() {
       'En preparación': 'Listo para servir',
       'Listo para servir': 'Entregado',
     }[order.status];
-    if (!next) return;
+    if (!next || pendingOrderIdsRef.current.has(order.id)) return;
+    pendingOrderIdsRef.current.add(order.id);
+    setPendingOrderIds((current) => [...current, order.id]);
+    let saved;
     try {
-      const saved = await updateOrder(restaurantId, { ...order, status: next });
+      saved = order.status === 'Nuevo pedido'
+        ? await acceptOrder(restaurantId, order.id)
+        : await advanceOrderStatus(restaurantId, order);
+      ordersMutationVersion.current += 1;
       setOrders((current) => current.map((entry) => entry.id === order.id ? saved : entry));
-      setToast(`${order.displayId}: ${next.toLowerCase()}`);
     } catch (error) {
       setToast(`No se pudo actualizar el pedido: ${error.message}`);
+      return;
+    } finally {
+      pendingOrderIdsRef.current.delete(order.id);
+      setPendingOrderIds((current) => current.filter((id) => id !== order.id));
+    }
+    if (order.status === 'Nuevo pedido') {
+      printKitchenTicket(saved, true);
+    } else {
+      setToast(`${order.displayId}: ${next.toLowerCase()}`);
+    }
+  }
+
+  async function printKitchenTicket(order, accepted = false) {
+    try {
+      await printTicket({ title: 'TICKET DE COCINA', content: formatKitchenTicket(order) });
+      if (accepted) setToast(`${order.displayId} aceptado. Verifica la impresión de cocina.`);
+    } catch (error) {
+      setToast(`${accepted ? 'Pedido aceptado, pero n' : 'N'}o se pudo abrir la impresión de cocina: ${error.message}. Revisa la impresora.`);
+    }
+  }
+
+  async function handleKitchenReprint(order) {
+    if (pendingOrderIdsRef.current.has(order.id)) return;
+    const id = restaurantId;
+    pendingOrderIdsRef.current.add(order.id);
+    setPendingOrderIds((current) => [...current, order.id]);
+    let printed = false;
+    try {
+      const current = await getOrder(id, order.id);
+      if (restaurantIdRef.current !== id) return;
+      if (!current.kitchenReprintNeeded || !['En preparación', 'Listo para servir'].includes(current.status)) {
+        ordersMutationVersion.current += 1;
+        setOrders((orders) => orders.map((entry) => entry.id === current.id ? current : entry));
+        setToast('El pedido o su impresión cambió. Revisa su estado actualizado.');
+        return;
+      }
+      await printTicket({ title: 'TICKET DE COCINA', content: formatKitchenTicket(current) });
+      printed = true;
+      const saved = await registerKitchenReprint(id, current);
+      if (restaurantIdRef.current === id) {
+        ordersMutationVersion.current += 1;
+        setOrders((orders) => orders.map((entry) => entry.id === saved.id ? saved : entry));
+        setToast('Ticket enviado. Verifica la impresión de cocina.');
+      }
+    } catch (error) {
+      if (restaurantIdRef.current === id) {
+        setToast(printed
+          ? `Se envió el ticket, pero no se pudo actualizar su estado: ${error.message}. Revisa antes de reintentar.`
+          : `No se pudo reimprimir el ticket de cocina: ${error.message}.`);
+      }
+    } finally {
+      pendingOrderIdsRef.current.delete(order.id);
+      setPendingOrderIds((current) => current.filter((entry) => entry !== order.id));
+    }
+  }
+
+  async function handleEditOrder(order, items) {
+    const saved = await editOrderItems(restaurantId, order, items);
+    if (restaurantIdRef.current === restaurantId) {
+      ordersMutationVersion.current += 1;
+      setOrders((current) => current.map((entry) => entry.id === saved.id ? saved : entry));
+      setEditingOrder(null);
+      setToast(saved.kitchenReprintNeeded
+        ? `${saved.displayId} actualizado. Puedes reimprimir el ticket de cocina.`
+        : `${saved.displayId}: no hubo cambios en los productos.`);
+    }
+  }
+
+  async function handleDeleteOrder(order) {
+    if (pendingOrderIdsRef.current.has(order.id)) return false;
+    if (!window.confirm(`¿Eliminar ${order.displayId} de la mesa ${order.table}? Esta acción no se puede deshacer. Avisa a cocina de la eliminación.`)) return false;
+    const id = restaurantId;
+    pendingOrderIdsRef.current.add(order.id);
+    setPendingOrderIds((current) => [...current, order.id]);
+    try {
+      await deleteOrder(id, order.id);
+      if (restaurantIdRef.current === id) {
+        ordersMutationVersion.current += 1;
+        setOrders((current) => current.filter((entry) => entry.id !== order.id));
+        setEditingOrder(null);
+        setToast(`${order.displayId} eliminado.`);
+      }
+      return true;
+    } finally {
+      pendingOrderIdsRef.current.delete(order.id);
+      setPendingOrderIds((current) => current.filter((entry) => entry !== order.id));
+    }
+  }
+
+  async function loadCurrentPaymentGroup(group, id) {
+    const version = ordersMutationVersion.current;
+    const latestOrders = await getOrders(id);
+    if (restaurantIdRef.current !== id) return null;
+    if (ordersMutationVersion.current !== version) throw new Error('Los pedidos cambiaron durante la consulta; vuelve a intentarlo.');
+    setOrders(latestOrders);
+    const pendingOrders = latestOrders.filter((order) => order.table === group.table && order.status === 'Entregado');
+    if (pendingOrders.length === 0) {
+      setToast(`La mesa ${group.table} ya no tiene pedidos entregados pendientes de pago.`);
+      return null;
+    }
+    return {
+      table: group.table,
+      orders: pendingOrders,
+      total: pendingOrders.reduce((sum, order) => sum + order.total, 0),
+    };
+  }
+
+  async function requestTablePayment(group) {
+    if (tableActionPendingRef.current) return;
+    tableActionPendingRef.current = true;
+    setTableActionPending(true);
+    setPaymentLoadError('');
+    const id = restaurantId;
+    try {
+      const currentGroup = await loadCurrentPaymentGroup(group, id);
+      if (currentGroup) setPaymentConfirmationGroup(currentGroup);
+    } catch (error) {
+      if (restaurantIdRef.current !== id) return;
+      setPaymentConfirmationGroup(group);
+      setPaymentLoadError(`No se pudieron actualizar los pedidos: ${error.message}. El servidor validará el total al confirmar.`);
+    } finally {
+      tableActionPendingRef.current = false;
+      setTableActionPending(false);
+    }
+  }
+
+  async function printTableReceipt(group) {
+    if (tableActionPendingRef.current) return;
+    tableActionPendingRef.current = true;
+    setTableActionPending(true);
+    setReceiptError('');
+    const id = restaurantId;
+    try {
+      const [currentGroup, rawTemplate] = await Promise.all([
+        loadCurrentPaymentGroup(group, id),
+        getTicketTemplate(id),
+      ]);
+      if (!currentGroup || restaurantIdRef.current !== id) return;
+      await printTicket(renderReceipt(resolveReceiptTemplate(rawTemplate), currentGroup, restaurant.nombre));
+    } catch (error) {
+      if (restaurantIdRef.current === id) {
+        setReceiptError(`No se pudo imprimir la cuenta de la mesa ${group.table}: ${error.message}. Vuelve a intentarlo.`);
+      }
+    } finally {
+      tableActionPendingRef.current = false;
+      setTableActionPending(false);
     }
   }
 
   async function confirmTablePayment(group) {
     const result = await payTableOrders(restaurantId, group.table, group.orders.map((order) => order.id), group.total, group.paymentMethod);
     const paidOrders = new Map(result.orders.map((order) => [order.id, order]));
+    ordersMutationVersion.current += 1;
     setOrders((current) => current.map((order) => paidOrders.get(order.id) || order));
     setPaymentConfirmationGroup(null);
     if (group.paymentMethod === 'EFECTIVO') {
@@ -542,6 +773,7 @@ function App() {
 
   async function handleCreateOrder(order) {
     const saved = await createOrder(restaurantId, order);
+    ordersMutationVersion.current += 1;
     setOrders((current) => [saved, ...current]);
     setOrderModalOpen(false);
     setToast(`${saved.displayId} creado para la mesa ${saved.table}`);
@@ -550,8 +782,16 @@ function App() {
   async function refreshOrders() {
     if (ordersRefreshInProgress.current) return;
     ordersRefreshInProgress.current = true;
+    const version = ordersMutationVersion.current;
+    const id = restaurantId;
     try {
-      setOrders(await getOrders(restaurantId));
+      const latestOrders = await getOrders(id);
+      if (restaurantIdRef.current !== id) return;
+      if (ordersMutationVersion.current !== version) {
+        setToast('Los pedidos cambiaron durante la actualización. Vuelve a intentarlo.');
+        return;
+      }
+      setOrders(latestOrders);
       ordersPollingError.current = false;
       setToast('Pedidos actualizados');
     } catch (error) {
@@ -603,7 +843,7 @@ function App() {
         <div className="nav-caption">MENÚ PRINCIPAL</div>
         <nav className="main-nav" aria-label="Navegación principal">
           {visibleNavItems.map((item) => (
-            <button key={item.id} className={`nav-link ${activeTab === item.id ? 'active' : ''}`} onClick={() => setActiveTab(item.id)}>
+            <button key={item.id} className={`nav-link ${activeTab === item.id ? 'active' : ''}`} onClick={() => setActiveTab(item.id)} aria-label={item.label}>
             <Icon name={item.icon} size={19} /><span>{item.label}</span>{item.id === 'orders' && <span className="nav-badge">{orders.filter((order) => order.status !== 'Pagado').length}</span>}
             </button>
           ))}
@@ -617,23 +857,26 @@ function App() {
       <main className="main-area">
         <header className="topbar">
           <div className="breadcrumb">{restaurant?.nombre || 'Administración'} <span>/</span> <strong>{pageTitle}</strong></div>
-          <div className="topbar-actions"><span className="today-label"><span className="live-dot" /> Servicio activo</span><button className="icon-button notification-button" aria-label="Notificaciones" onClick={() => setToast('No tienes notificaciones nuevas')}><Icon name="bell" size={19} /><i /></button><span className="today-date">{todayShort}</span></div>
+          <div className="topbar-actions"><PrinterButton usb={usb} onMessage={setToast} /><span className="today-label"><span className="live-dot" /> Servicio activo</span><button className="icon-button notification-button" aria-label="Notificaciones" onClick={() => setToast('No tienes notificaciones nuevas')}><Icon name="bell" size={19} /><i /></button><span className="today-date">{todayShort}</span></div>
         </header>
 
         <div className="page-content">
           {activeTab === 'home' && <HomePage setActiveTab={setActiveTab} orders={orders} menuItems={menuItems} user={user} totalSales={orderTotal} averageTicket={averageTicket} activeTables={activeTables} todayLong={todayLong} canManageMenu={canManageMenu} cashRegister={cashRegister} cashVisible={cashVisible} onToggleCashVisibility={toggleCashVisibility} onOpenCash={() => setCashModalOpen(true)} onCloseCash={handleCloseCash} />}
           {activeTab === 'menu' && <MenuPage items={filteredItems} loading={loading} menusLoading={menusLoading} orderItemsLoading={orderItemsLoading} categories={categories} category={category} setCategory={setCategory} query={query} setQuery={setQuery} menus={menus} selectedMenuId={selectedMenuId} setSelectedMenuId={setSelectedMenuId} onCreateMenu={handleCreateMenu} onAdd={() => setModalItem({})} onEdit={setModalItem} onDelete={handleDelete} />}
-          {activeTab === 'orders' && <OrdersPage orders={orders} onAdvance={advanceOrder} onRefresh={refreshOrders} onCreate={() => setOrderModalOpen(true)} onRequestPayment={setPaymentConfirmationGroup} products={orderItems} productsLoading={orderItemsLoading} />}
+          {activeTab === 'orders' && <OrdersPage orders={orders} onAdvance={advanceOrder} onPrintKitchen={handleKitchenReprint} onEdit={setEditingOrder} pendingOrderIds={pendingOrderIds} onRefresh={refreshOrders} onCreate={() => setOrderModalOpen(true)} onRequestPayment={requestTablePayment} onPrintReceipt={printTableReceipt} tableActionPending={tableActionPending} receiptError={receiptError} products={orderItems} productsLoading={orderItemsLoading} countdown={countdown} setCountdown={setCountdown} countdownBusy={countdownBusy} countdownError={countdownError} />}
           {activeTab === 'business' && <BusinessPage orders={orders} totalSales={orderTotal} />}
           {activeTab === 'staff' && canManageStaff && <RestaurantStaffPage restaurant={restaurant} users={restaurantUsers} usersLoading={restaurantUsersLoading} currentUserId={user.idUsuario} onCreate={handleCreateRestaurantUser} onUpdate={handleUpdateRestaurantUser} onDelete={handleDeleteRestaurantUser} />}
           {activeTab === 'master' && isMaster && <MasterAdminPage restaurants={restaurants} users={masterUsers} usersLoading={masterUsersLoading} currentUserId={user.idUsuario} onCreateRestaurant={handleCreateRestaurant} onCreateUser={handleCreateUser} onUpdateUser={handleUpdateUser} onDeleteUser={handleDeleteUser} />}
+          {activeTab === 'tickets' && canManageTickets && <TicketPage key={restaurantId ?? 'none'} restaurantId={restaurantId} printTicket={printTicket} usb={usb} />}
         </div>
       </main>
       {modalItem !== null && <MenuModal item={modalItem} onClose={() => setModalItem(null)} onSave={handleSave} />}
       {orderModalOpen && <OrderModal products={orderItems.filter((item) => item.available)} onClose={() => setOrderModalOpen(false)} onSave={handleCreateOrder} />}
-      {paymentConfirmationGroup && <PaymentConfirmationModal group={paymentConfirmationGroup} onClose={() => setPaymentConfirmationGroup(null)} onConfirm={confirmTablePayment} />}
+      {editingOrder && <EditOrderModal order={editingOrder} products={orderItems} onClose={() => setEditingOrder(null)} onSave={handleEditOrder} onDelete={handleDeleteOrder} />}
+      {paymentConfirmationGroup && <PaymentConfirmationModal group={paymentConfirmationGroup} loadError={paymentLoadError} onClose={() => setPaymentConfirmationGroup(null)} onConfirm={confirmTablePayment} />}
       {cashModalOpen && <CashOpenModal onClose={() => setCashModalOpen(false)} onOpen={handleOpenCash} />}
       {toast && <div className="toast"><span className="toast-check"><Icon name="check" size={15} /></span>{toast}</div>}
+      {printableTicket}
     </div>
   );
 }
@@ -966,7 +1209,7 @@ function MenuPage({ items, loading, menusLoading, orderItemsLoading, categories,
 }
 
 // Vista operativa de pedidos activos e historial reciente.
-function OrdersPage({ orders, onAdvance, onRefresh, onCreate, onRequestPayment, products, productsLoading }) {
+function OrdersPage({ orders, onAdvance, onPrintKitchen, onEdit, pendingOrderIds, onRefresh, onCreate, onRequestPayment, onPrintReceipt, tableActionPending, receiptError, products, productsLoading, countdown, setCountdown, countdownBusy, countdownError }) {
   const active = orders.filter((order) => order.status !== 'Entregado' && order.status !== 'Pagado');
   const pendingPayment = orders.filter((order) => order.status === 'Entregado');
   const paymentGroupsByTable = pendingPayment.reduce((groups, order) => {
@@ -985,35 +1228,95 @@ function OrdersPage({ orders, onAdvance, onRefresh, onCreate, onRequestPayment, 
     </PageHeading>
     {!productsLoading && !canCreate && <div className="order-create-hint">No hay productos disponibles para agregar a un pedido. Pide al administrador que configure el menú.</div>}
     <div className="order-overview"><div className="order-overview-card"><span className="overview-icon orange"><Icon name="orders" size={18} /></span><span><strong>{active.length}</strong><small>Pedidos activos</small></span></div><div className="order-overview-card"><span className="overview-icon purple"><Icon name="clock" size={18} /></span><span><strong>{orders.filter((order) => order.status === 'En preparación').length}</strong><small>En preparación</small></span></div><div className="order-overview-card"><span className="overview-icon green"><Icon name="check" size={18} /></span><span><strong>{orders.filter((order) => order.status === 'Listo para servir').length}</strong><small>Listos para servir</small></span></div><div className="order-overview-card"><span className="overview-icon blue"><Icon name="check" size={18} /></span><span><strong>{paymentGroups.length}</strong><small>Mesas por pagar</small></span></div><div className="service-status"><span className="live-dot" /> Recibiendo pedidos <small>Actualizado ahora</small></div></div>
-    <div className="orders-toolbar"><div><h2>Pedidos en curso <span>{active.length}</span></h2><p>Gestiona los pedidos activos de tu restaurante</p></div><div className="orders-legend"><span><i className="legend-new" /> Nuevo</span><span><i className="legend-preparing" /> Preparando</span><span><i className="legend-ready" /> Listo</span></div></div>
-    <div className="orders-grid">{active.map((order) => <OrderCard key={order.id} order={order} onAdvance={onAdvance} />)}</div>
-    {paymentGroups.length > 0 && <><div className="orders-toolbar payment-orders-heading"><div><h2>Mesas por pagar <span>{paymentGroups.length}</span></h2><p>Los pedidos entregados de cada mesa se cobran juntos en un solo total</p></div></div><div className="orders-grid">{paymentGroups.map((group) => <TablePaymentCard key={group.table} group={group} onPay={() => onRequestPayment(group)} />)}</div></>}
+    <div className="orders-toolbar"><div><h2>Pedidos en curso <span>{active.length}</span></h2><p>Gestiona los pedidos activos de tu restaurante</p></div><div className="orders-toolbar-right"><OrderCountdown countdown={countdown} setCountdown={setCountdown} busy={countdownBusy} /><div className="orders-legend"><span><i className="legend-new" /> Nuevo</span><span><i className="legend-preparing" /> Preparando</span><span><i className="legend-ready" /> Listo</span></div></div></div>
+    {countdownError && <div className="form-error" role="alert">{countdownError}</div>}
+    <div className="orders-grid">{active.map((order) => <OrderCard key={order.id} order={order} onAdvance={onAdvance} onPrintKitchen={onPrintKitchen} onEdit={onEdit} pending={pendingOrderIds.includes(order.id)} productsLoading={productsLoading} />)}</div>
+    {receiptError && <div className="form-error" role="alert">{receiptError}</div>}
+    {paymentGroups.length > 0 && <><div className="orders-toolbar payment-orders-heading"><div><h2>Mesas por pagar <span>{paymentGroups.length}</span></h2><p>Los pedidos entregados de cada mesa se cobran juntos en un solo total</p></div></div><div className="orders-grid">{paymentGroups.map((group) => <TablePaymentCard key={group.table} group={group} onPay={() => onRequestPayment(group)} onPrint={() => onPrintReceipt(group)} disabled={tableActionPending} />)}</div></>}
     {active.length === 0 && pendingPayment.length === 0 && <div className="panel empty-state"><span>✓</span><strong>¡Todo al día!</strong><p>No hay pedidos pendientes por ahora.</p></div>}
     <section className="recent-orders-table panel"><div className="panel-header"><div><h2>Actividad reciente</h2><p>Historial de pedidos recibidos</p></div></div><div className="table-scroll"><table><thead><tr><th>PEDIDO</th><th>MESA</th><th>GARZÓN</th><th>HORA</th><th>ESTADO</th><th>TOTAL</th></tr></thead><tbody>{orders.map((order) => <tr key={order.id}><td className="table-order-id">{order.displayId}</td><td>Mesa {order.table}</td><td>{order.server}</td><td>{order.time}</td><td><span className={`order-status ${statusClass(order.status)}`}>{order.status}</span></td><td><strong>{money(order.total)}</strong></td></tr>)}</tbody></table></div></section>
   </>;
 }
 
+function OrderCountdown({ countdown, setCountdown, busy }) {
+  const [now, setNow] = useState(() => Date.now());
+  const remainingMs = countdown.deadline === null ? countdown.remainingMs : Math.max(0, countdown.deadline - now);
+  const running = countdown.deadline !== null && remainingMs > 0;
+  const finished = countdown.deadline !== null && remainingMs === 0;
+  const validInput = countdown.editValue === null || parseCountdownTime(countdown.editValue) !== null;
+  const seconds = Math.ceil(remainingMs / 1000);
+  const display = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+
+  useEffect(() => {
+    if (countdown.deadline === null || finished) return undefined;
+    const update = () => setNow(Date.now());
+    update();
+    const interval = window.setInterval(update, 250);
+    return () => window.clearInterval(interval);
+  }, [countdown.deadline, finished]);
+
+  function changeTime(value) {
+    const durationMs = parseCountdownTime(value);
+    setCountdown((current) => durationMs === null
+      ? { ...current, editValue: value }
+      : { ...current, durationMs, remainingMs: durationMs, deadline: null, editValue: value });
+  }
+
+  function start() {
+    const currentTime = Date.now();
+    const duration = countdown.deadline !== null || countdown.remainingMs <= 0 ? countdown.durationMs : countdown.remainingMs;
+    setNow(currentTime);
+    setCountdown((current) => ({ ...current, editValue: null, deadline: currentTime + duration }));
+  }
+
+  function pause() {
+    setCountdown({ ...countdown, remainingMs: Math.max(0, countdown.deadline - Date.now()), deadline: null });
+  }
+
+  function reset() {
+    setCountdown({ ...countdown, remainingMs: countdown.durationMs, deadline: null, editValue: null });
+  }
+
+  return <div className="order-countdown">
+    <input className={`countdown-display${finished ? ' finished' : ''}`} type="text" maxLength={7} aria-label="Tiempo restante, minutos y segundos" aria-invalid={!validInput} aria-describedby={!validInput ? 'countdown-error' : undefined} title={running ? 'Pausa el temporizador para editar el tiempo' : 'Edita el tiempo en formato MM:SS'} value={countdown.editValue ?? display} readOnly={running || busy} onChange={(event) => changeTime(event.target.value)} onBlur={() => { if (validInput) setCountdown((current) => ({ ...current, editValue: null })); }} />
+    {running
+      ? <button className="outline-button" type="button" onClick={pause} disabled={busy}>Pausar</button>
+      : <button className="primary-button" type="button" onClick={start} disabled={!validInput || busy}>{countdown.deadline === null && countdown.remainingMs > 0 && countdown.remainingMs !== countdown.durationMs ? 'Continuar' : 'Iniciar'}</button>}
+    <button className="outline-button" type="button" onClick={reset} disabled={busy}>Reiniciar</button>
+    {busy && <span className="countdown-finished" role="status">Aceptando pedido...</span>}
+    {!validInput && <span className="countdown-finished" id="countdown-error" role="alert">Ingresa un tiempo entre 00:01 y 1440:00 (MM:SS).</span>}
+  </div>;
+}
+
+function parseCountdownTime(value) {
+  const match = /^(\d{1,4}):([0-5]\d)$/.exec(value);
+  if (!match) return null;
+  const totalSeconds = Number(match[1]) * 60 + Number(match[2]);
+  return totalSeconds >= 1 && totalSeconds <= 1440 * 60 ? totalSeconds * 1000 : null;
+}
+
 // Tarjeta de un pedido, con sus productos, total y acción para avanzar su estado.
-function OrderCard({ order, onAdvance }) {
+function OrderCard({ order, onAdvance, onPrintKitchen, onEdit, pending, productsLoading }) {
   const action = {
     'Nuevo pedido': 'Aceptar pedido',
     'En preparación': 'Marcar como listo',
     'Listo para servir': 'Marcar entregado',
   }[order.status];
   const isReady = order.status === 'Listo para servir';
-  return <article className={`order-card ${statusClass(order.status)}`}><div className="order-card-top"><div><span className="order-id">{order.displayId}</span><h3>Mesa {order.table}</h3></div><span className={`order-status ${statusClass(order.status)}`}>{order.status}</span></div><div className="order-meta"><span><Icon name="clock" size={15} />{order.time}</span><span>Garzón <strong>{order.server}</strong></span></div><div className="order-items">{order.items.map((item) => <div key={item.idItemRestaurante}><span><b>{item.quantity}×</b> {item.name}</span><small>{money(item.unitPrice * item.quantity)}</small></div>)}</div><div className="order-total"><span>Total del pedido</span><strong>{money(order.total)}</strong></div><button className={`order-action ${isReady ? 'ready-action' : ''}`} onClick={() => onAdvance(order)}>{isReady ? <Icon name="check" size={17} /> : null}{action}{!isReady && <Icon name="arrow" size={16} />}</button></article>;
+  return <article className={`order-card ${statusClass(order.status)}`}><div className="order-card-top"><div><span className="order-id">{order.displayId}</span><h3>Mesa {order.table}</h3></div><div className="order-card-status">{order.status === 'En preparación' && <button className="order-edit-button" type="button" onClick={() => onEdit(order)} disabled={pending || productsLoading} aria-label={`Modificar pedido ${order.displayId}`}><Icon name="edit" size={13} />Modificar</button>}<span className={`order-status ${statusClass(order.status)}`}>{order.status}</span></div></div><div className="order-meta"><span><Icon name="clock" size={15} />{order.time}</span><span>Garzón <strong>{order.server}</strong></span></div><div className="order-items">{order.items.map((item) => <div key={item.idItemRestaurante}><span><b>{item.quantity}×</b> {item.name}</span><small>{money(item.unitPrice * item.quantity)}</small></div>)}</div><div className="order-total"><span>Total del pedido</span><strong>{money(order.total)}</strong></div><button className={`order-action ${isReady ? 'ready-action' : ''}`} onClick={() => onAdvance(order)} disabled={pending}>{isReady ? <Icon name="check" size={17} /> : null}{action}{!isReady && <Icon name="arrow" size={16} />}</button>{order.status !== 'Nuevo pedido' && order.kitchenReprintNeeded && <button className="order-action kitchen-reprint" onClick={() => onPrintKitchen(order)} disabled={pending}>Reimprimir cocina</button>}</article>;
 }
 
-function TablePaymentCard({ group, onPay }) {
+function TablePaymentCard({ group, onPay, onPrint, disabled }) {
   return <article className="order-card delivered table-payment-card">
     <div className="order-card-top"><div><span className="order-id">{group.orders.length} pedidos entregados</span><h3>Mesa {group.table}</h3></div><span className="order-status delivered">Por pagar</span></div>
     <div className="payment-group-orders">{group.orders.map((order) => <div key={order.id}><span><b>{order.displayId}</b><small>{order.items.length} productos</small></span><strong>{money(order.total)}</strong></div>)}</div>
     <div className="order-total"><span>Total de la mesa</span><strong>{money(group.total)}</strong></div>
-    <button className="order-action payment-action" onClick={onPay}><Icon name="check" size={17} />Confirmar pago total</button>
+    <button className="order-action payment-action" onClick={onPay} disabled={disabled}><Icon name="check" size={17} />Confirmar pago total</button>
+    <button className="order-action table-print-button" onClick={onPrint} disabled={disabled} aria-label={`Imprimir cuenta de la mesa ${group.table}`}><Icon name="printer" size={16} />Imprimir cuenta</button>
   </article>;
 }
 
-function PaymentConfirmationModal({ group, onClose, onConfirm }) {
+function PaymentConfirmationModal({ group, loadError, onClose, onConfirm }) {
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState('');
@@ -1038,14 +1341,14 @@ function PaymentConfirmationModal({ group, onClose, onConfirm }) {
     <section className="modal payment-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="payment-modal-title">
       <div className="modal-header"><div><div className="eyebrow">CIERRE DE MESA</div><h2 id="payment-modal-title">Confirmar pago total</h2></div><button className="icon-button" onClick={onClose} aria-label="Cerrar" disabled={saving}><Icon name="close" size={19} /></button></div>
       <p className="payment-confirm-copy">Se finalizarán juntos los {group.orders.length} pedidos entregados de la mesa {group.table}. Confirma que recibiste este pago total.</p>
+      {loadError && <div className="form-error" role="alert">{loadError}</div>}
       <div className="payment-confirm-details"><div className="payment-order-breakdown">{group.orders.map((order) => <div key={order.id}><span>{order.displayId}</span><strong>{money(order.total)}</strong></div>)}</div><div className="payment-combined-total"><span>Total único de la mesa</span><strong>{money(group.total)}</strong></div></div>
       <fieldset className="payment-method-field">
         <legend>Método de pago</legend>
         <div className="payment-method-options">
           {[
             ['EFECTIVO', 'Efectivo'],
-            ['DEBITO', 'Débito'],
-            ['CREDITO', 'Crédito'],
+            ['TARJETA', 'Débito / Crédito'],
           ].map(([value, label]) => (
             <label key={value} className={paymentMethod === value ? 'selected' : ''}>
               <input
@@ -1142,6 +1445,88 @@ function OrderModal({ products, onClose, onSave }) {
         {error && <div className="form-error" role="alert">{error}</div>}
         <div className="order-modal-total"><span>Total del pedido</span><strong>{money(total)}</strong></div>
         <div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>Cancelar</button><button type="submit" className="primary-button" disabled={saving || selectedItems.length === 0}><Icon name="check" size={17} />{saving ? 'Creando…' : 'Crear pedido'}</button></div>
+      </form>
+    </section>
+  </div>;
+}
+
+function EditOrderModal({ order, products, onClose, onSave, onDelete }) {
+  const [quantities, setQuantities] = useState(() => Object.fromEntries(
+    order.items.map((item) => [item.idItemRestaurante, String(item.quantity)]),
+  ));
+  const [addedIds, setAddedIds] = useState([]);
+  const [removedIds, setRemovedIds] = useState([]);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const busy = saving || deleting;
+  const existingIds = new Set(order.items.map((item) => item.idItemRestaurante));
+  const choices = [
+    ...order.items.map((item) => {
+      const current = products.find((product) => product.id === item.idItemRestaurante);
+      return {
+        id: item.idItemRestaurante,
+        name: item.name,
+        price: item.unitPrice,
+        available: current?.available === true,
+        originalQuantity: item.quantity,
+      };
+    }),
+    ...products.filter((item) => item.available && !existingIds.has(item.id)),
+  ];
+  const orderChoices = choices.filter((item) =>
+    (existingIds.has(item.id) && !removedIds.includes(item.id)) || addedIds.includes(item.id));
+  const availableChoices = choices.filter((item) =>
+    removedIds.includes(item.id) || (!existingIds.has(item.id) && !addedIds.includes(item.id)));
+  const selectedItems = choices.map((item) => ({
+    idItemRestaurante: item.id,
+    quantity: Number(quantities[item.id] || 0),
+  })).filter((item) => item.quantity > 0);
+  const total = choices.reduce((sum, item) => sum + item.price * Number(quantities[item.id] || 0), 0);
+
+  async function submit(event) {
+    event.preventDefault();
+    if (selectedItems.length === 0) {
+      setError('El pedido debe conservar al menos un producto. Para quitarlo completo, usa Eliminar pedido.');
+      return;
+    }
+    setError('');
+    setSaving(true);
+    try {
+      await onSave(order, selectedItems);
+    } catch (saveError) {
+      setError(saveError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove() {
+    setError('');
+    setDeleting(true);
+    try {
+      await onDelete(order);
+    } catch (deleteError) {
+      setError(`No se pudo eliminar el pedido: ${deleteError.message}`);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (!busy && event.target === event.currentTarget) onClose(); }}>
+    <section className="modal order-create-modal" role="dialog" aria-modal="true" aria-labelledby="edit-order-title">
+      <div className="modal-header"><div><div className="eyebrow">MESA {order.table}</div><h2 id="edit-order-title">Modificar {order.displayId}</h2></div><button className="icon-button" onClick={onClose} aria-label="Cerrar" disabled={busy}><Icon name="close" size={19} /></button></div>
+      <form onSubmit={submit}>
+        <p className="edit-order-hint">Cambia las cantidades o quita productos. Los productos existentes conservan su precio original.</p>
+        <div className="form-field">Productos del pedido</div>
+        <div className="order-product-list">{orderChoices.map((item) => <div className="order-product-row" key={item.id}><span><strong>{item.name}</strong><small>{money(item.price)}{!item.available ? ' · No disponible; solo se puede reducir' : ''}</small></span><input aria-label={`Cantidad de ${item.name}`} type="number" min="0" max={item.available ? 2147483647 : item.originalQuantity} step="1" value={quantities[item.id] ?? ''} placeholder="0" disabled={busy} onChange={(event) => setQuantities({ ...quantities, [item.id]: event.target.value })} /><button className="order-remove-item" type="button" aria-label={`Quitar ${item.name}`} disabled={busy} onClick={() => { setQuantities({ ...quantities, [item.id]: '0' }); if (existingIds.has(item.id)) setRemovedIds([...removedIds, item.id]); else setAddedIds(addedIds.filter((id) => id !== item.id)); }}>Quitar</button></div>)}</div>
+        <div className="form-field">Agregar productos del menú</div>
+        {availableChoices.length > 0
+          ? <div className="order-product-list">{availableChoices.map((item) => <div className="order-product-row" key={item.id}><span><strong>{item.name}</strong><small>{existingIds.has(item.id) ? `Precio original${item.available ? '' : ' · No disponible, solo para restaurar'}` : item.category} · {money(item.price)}</small></span><button className="order-add-item" type="button" aria-label={`Agregar ${item.name}`} disabled={busy} onClick={() => { if (existingIds.has(item.id)) setRemovedIds(removedIds.filter((id) => id !== item.id)); else setAddedIds([...addedIds, item.id]); setQuantities({ ...quantities, [item.id]: '1' }); }}>+ Agregar</button></div>)}</div>
+          : <p className="edit-order-hint">No hay más productos disponibles para agregar.</p>}
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <div className="order-modal-total"><span>Total del pedido</span><strong>{money(total)}</strong></div>
+        <div className="modal-actions edit-order-modal-actions"><button type="button" className="danger-button" onClick={remove} disabled={busy}>{deleting ? 'Eliminando…' : 'Eliminar pedido'}</button><button type="button" className="outline-button" onClick={onClose} disabled={busy}>Cancelar</button><button type="submit" className="primary-button" disabled={busy}>{saving ? 'Guardando…' : 'Guardar cambios'}</button></div>
       </form>
     </section>
   </div>;

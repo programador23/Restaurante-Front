@@ -60,6 +60,14 @@ export function getRestaurants() {
   return request('/restaurantes');
 }
 
+export function getTicketTemplate(idRestaurante) {
+  return request(`/restaurantes/${idRestaurante}/plantilla-ticket`);
+}
+
+export function saveTicketTemplate(idRestaurante, template) {
+  return request(`/restaurantes/${idRestaurante}/plantilla-ticket`, { method: 'PUT', body: template });
+}
+
 export function createRestaurant(restaurant) {
   return request('/restaurantes', {
     method: 'POST',
@@ -195,6 +203,11 @@ export async function getOrders(idRestaurante) {
   return orders.map(mapOrder).sort((a, b) => b.createdAt - a.createdAt);
 }
 
+export async function getOrder(idRestaurante, idPedido) {
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${idPedido}`);
+  return mapOrder(result);
+}
+
 export async function createOrder(idRestaurante, order) {
   const result = await request(`/restaurantes/${idRestaurante}/pedidos`, {
     method: 'POST',
@@ -223,6 +236,48 @@ export async function updateOrder(idRestaurante, order) {
         cantidad: item.quantity,
       })),
     },
+  });
+  return mapOrder(result);
+}
+
+export async function acceptOldestOrder(idRestaurante) {
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/aceptar-mas-antiguo`, { method: 'POST' });
+  return result === null ? null : mapOrder(result);
+}
+
+export async function acceptOrder(idRestaurante, idPedido) {
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${idPedido}/aceptar`, { method: 'POST' });
+  return mapOrder(result);
+}
+
+export async function editOrderItems(idRestaurante, order, selectedItems) {
+  const toApiItems = (items) => items.map((item) => ({
+    idItemRestaurante: item.idItemRestaurante,
+    cantidad: item.quantity,
+  }));
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${order.id}/items`, {
+    method: 'PUT',
+    body: { itemsOriginales: toApiItems(order.items), items: toApiItems(selectedItems) },
+  });
+  return mapOrder(result);
+}
+
+export async function advanceOrderStatus(idRestaurante, order) {
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${order.id}/avanzar`, {
+    method: 'POST',
+    body: { estadoActual: apiStatus(order.status) },
+  });
+  return mapOrder(result);
+}
+
+export function deleteOrder(idRestaurante, idPedido) {
+  return request(`/restaurantes/${idRestaurante}/pedidos/${idPedido}`, { method: 'DELETE' });
+}
+
+export async function registerKitchenReprint(idRestaurante, order) {
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${order.id}/reimpresion-cocina`, {
+    method: 'POST',
+    body: { revision: order.kitchenRevision },
   });
   return mapOrder(result);
 }
@@ -283,6 +338,8 @@ function mapOrder(order) {
     time: new Intl.DateTimeFormat('es-CL', { hour: '2-digit', minute: '2-digit' }).format(createdAt),
     status: statusNames[order.estado] || order.estado,
     paymentMethod: order.metodoPago || null,
+    kitchenRevision: order.revisionCocina,
+    kitchenReprintNeeded: order.reimpresionCocinaPendiente === true,
     items: order.items.map((item) => ({
       idItemRestaurante: item.idItemRestaurante,
       name: item.nombre,
