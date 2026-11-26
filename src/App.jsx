@@ -1,5 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import TicketPage from './TicketPage';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import { useTicketPrinter } from './TicketPrinter';
 import PrinterButton from './PrinterButton';
 import { formatKitchenTicket } from './kitchenTicket';
@@ -40,7 +39,25 @@ import {
   updateUser,
 } from './api';
 
+const TicketPage = lazy(() => import('./TicketPage'));
+
+const ORDERS_POLL_INTERVAL_MS = 15000;
+const ORDERS_POLL_MAX_INTERVAL_MS = 60000;
+
 const money = (value) => `$${new Intl.NumberFormat('es-CL').format(value)}`;
+
+const FALLBACK_IMAGE = 'https://images.unsplash.com/photo-1546549032-9571cd6b27df?auto=format&fit=crop&w=800&q=85';
+
+// Si la imagen falla, prueba una vez con la imagen por defecto; si también falla, la oculta sin alterar el layout.
+function handleImageError(event) {
+  const img = event.currentTarget;
+  if (img.src !== FALLBACK_IMAGE && !img.dataset.fallbackTried) {
+    img.dataset.fallbackTried = 'true';
+    img.src = FALLBACK_IMAGE;
+  } else {
+    img.style.visibility = 'hidden';
+  }
+}
 
 // Trazos SVG reutilizables para mantener los iconos consistentes en todo el panel.
 const icons = {
@@ -154,7 +171,7 @@ function App() {
     (item.id !== 'tickets' || canManageTickets) &&
     (item.id !== 'master' || isMaster),
   );
-  const orderTotal = orders.reduce((total, order) => total + order.total, 0);
+  const orderTotal = useMemo(() => orders.reduce((total, order) => total + order.total, 0), [orders]);
 
   useEffect(() => {
     setReceiptError('');
@@ -380,6 +397,12 @@ function App() {
       setLoading(false);
       return undefined;
     }
+    // Quien puede gestionar el menú también puede crear pedidos: sus productos ya están en orderItems.
+    if (canCreateOrders) {
+      setMenuItems(orderItems.filter((item) => item.menuId === selectedMenuId));
+      setLoading(false);
+      return undefined;
+    }
     let active = true;
     setLoading(true);
     getMenu(selectedMenuId)
@@ -387,7 +410,7 @@ function App() {
       .catch((error) => { if (active) setToast(`No se pudo cargar el menú: ${error.message}`); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [selectedMenuId, canManageMenu]);
+  }, [selectedMenuId, canManageMenu, canCreateOrders, orderItems]);
 
   useEffect(() => {
     if (!visibleNavItems.some((item) => item.id === activeTab)) setActiveTab('home');
@@ -399,30 +422,51 @@ function App() {
     }
 
     let active = true;
+    let timer = null;
+    let delay = ORDERS_POLL_INTERVAL_MS;
+    const controller = new AbortController();
     ordersPollingError.current = false;
-    const timer = window.setInterval(async () => {
-      if (!active || document.visibilityState !== 'visible' || ordersRefreshInProgress.current) return;
+
+    // Polling recursivo: el siguiente tick se programa solo cuando termina el anterior.
+    const schedule = () => {
+      if (active) timer = window.setTimeout(tick, delay);
+    };
+
+    async function tick() {
+      if (!active) return;
+      if (document.visibilityState !== 'visible' || ordersRefreshInProgress.current) {
+        schedule();
+        return;
+      }
       ordersRefreshInProgress.current = true;
       const version = ordersMutationVersion.current;
       try {
-        const latestOrders = await getOrders(restaurantId);
+        const latestOrders = await getOrders(restaurantId, { signal: controller.signal });
         if (active) {
           if (ordersMutationVersion.current === version) setOrders(latestOrders);
           ordersPollingError.current = false;
+          delay = ORDERS_POLL_INTERVAL_MS;
         }
       } catch (error) {
-        if (active && !ordersPollingError.current) {
-          setToast(`No se pudieron actualizar los pedidos: ${error.message}`);
+        if (error?.name !== 'AbortError' && active) {
+          if (!ordersPollingError.current) {
+            setToast(`No se pudieron actualizar los pedidos: ${error.message}`);
+          }
+          ordersPollingError.current = true;
+          delay = Math.min(delay * 2, ORDERS_POLL_MAX_INTERVAL_MS);
         }
-        if (active) ordersPollingError.current = true;
       } finally {
         ordersRefreshInProgress.current = false;
       }
-    }, 15000);
+      schedule();
+    }
+
+    schedule();
 
     return () => {
       active = false;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
+      controller.abort();
     };
   }, [activeTab, restaurantId, user]);
 
@@ -439,12 +483,15 @@ function App() {
       ...menuItems.map((item) => item.category),
     ]),
   ], [menuItems]);
-  const filteredItems = menuItems.filter((item) =>
-    (category === 'Todos' || item.category === category) &&
-    `${item.name} ${item.description}`.toLowerCase().includes(query.toLowerCase()),
-  );
+  const filteredItems = useMemo(() => {
+    const normalizedQuery = query.toLowerCase();
+    return menuItems.filter((item) =>
+      (category === 'Todos' || item.category === category) &&
+      `${item.name} ${item.description}`.toLowerCase().includes(normalizedQuery),
+    );
+  }, [menuItems, category, query]);
   const pageTitle = visibleNavItems.find((item) => item.id === activeTab)?.label;
-  const activeTables = new Set(orders.filter((order) => order.status !== 'Pagado').map((order) => order.table)).size;
+  const activeTables = useMemo(() => new Set(orders.filter((order) => order.status !== 'Pagado').map((order) => order.table)).size, [orders]);
   const averageTicket = orders.length ? Math.round(orderTotal / orders.length) : 0;
   const todayShort = new Intl.DateTimeFormat('es-CL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date());
   const todayLong = new Intl.DateTimeFormat('es-CL', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date());
@@ -867,7 +914,7 @@ function App() {
           {activeTab === 'business' && <BusinessPage orders={orders} totalSales={orderTotal} />}
           {activeTab === 'staff' && canManageStaff && <RestaurantStaffPage restaurant={restaurant} users={restaurantUsers} usersLoading={restaurantUsersLoading} currentUserId={user.idUsuario} onCreate={handleCreateRestaurantUser} onUpdate={handleUpdateRestaurantUser} onDelete={handleDeleteRestaurantUser} />}
           {activeTab === 'master' && isMaster && <MasterAdminPage restaurants={restaurants} users={masterUsers} usersLoading={masterUsersLoading} currentUserId={user.idUsuario} onCreateRestaurant={handleCreateRestaurant} onCreateUser={handleCreateUser} onUpdateUser={handleUpdateUser} onDeleteUser={handleDeleteUser} />}
-          {activeTab === 'tickets' && canManageTickets && <TicketPage key={restaurantId ?? 'none'} restaurantId={restaurantId} printTicket={printTicket} usb={usb} />}
+          {activeTab === 'tickets' && canManageTickets && <Suspense fallback={<div className="panel">Cargando…</div>}><TicketPage key={restaurantId ?? 'none'} restaurantId={restaurantId} printTicket={printTicket} usb={usb} /></Suspense>}
         </div>
       </main>
       {modalItem !== null && <MenuModal item={modalItem} onClose={() => setModalItem(null)} onSave={handleSave} />}
@@ -1178,7 +1225,7 @@ function HomePage({ setActiveTab, orders, menuItems, user, totalSales, averageTi
       </section>
     </div>
     {canManageMenu && <div className="home-bottom">
-      <section className="panel top-products"><div className="panel-header"><div><h2>Productos del menú</h2><p>Productos cargados para este restaurante</p></div><button className="text-link" onClick={() => setActiveTab('menu')}>Ver menú <Icon name="arrow" size={15} /></button></div><div className="product-rank-list">{menuItems.slice(0, 3).map((item, index) => <div className="product-rank" key={item.id}><span className="rank-number">0{index + 1}</span><img src={item.image || 'https://images.unsplash.com/photo-1546549032-9571cd6b27df?auto=format&fit=crop&w=800&q=85'} alt="" /><span className="rank-name">{item.name}</span><span className="rank-sold">{item.category}</span><strong>{money(item.price)}</strong></div>)}</div></section>
+      <section className="panel top-products"><div className="panel-header"><div><h2>Productos del menú</h2><p>Productos cargados para este restaurante</p></div><button className="text-link" onClick={() => setActiveTab('menu')}>Ver menú <Icon name="arrow" size={15} /></button></div><div className="product-rank-list">{menuItems.slice(0, 3).map((item, index) => <div className="product-rank" key={item.id}><span className="rank-number">0{index + 1}</span><img src={item.image || FALLBACK_IMAGE} alt="" loading="lazy" decoding="async" onError={handleImageError} /><span className="rank-name">{item.name}</span><span className="rank-sold">{item.category}</span><strong>{money(item.price)}</strong></div>)}</div></section>
       <section className="tip-card"><div className="tip-sparkle">✳</div><div className="eyebrow">MESA LISTA</div><h3>Tu menú, siempre<br />al día.</h3><p>Administra disponibilidad, descripciones y precios directamente desde el catálogo.</p><button onClick={() => setActiveTab('menu')}>Administrar menú <Icon name="arrow" size={15} /></button></section>
     </div>}
   </>;
@@ -1202,7 +1249,7 @@ function MenuPage({ items, loading, menusLoading, orderItemsLoading, categories,
     </PageHeading>
     <section className="panel menu-panel">
       <div className="menu-toolbar"><div className="category-tabs">{categories.map((item) => <button key={item} className={`category-tab ${category === item ? 'selected' : ''}`} onClick={() => setCategory(item)}>{item}</button>)}</div><label className="search-box"><Icon name="search" size={18} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar producto..." /></label></div>
-      {menusLoading || orderItemsLoading || loading ? <div className="empty-state">Cargando menú...</div> : menus.length === 0 ? <div className="empty-state"><span>☝</span><strong>Este restaurante aún no tiene un menú</strong><p>Crea el menú principal para empezar a agregar productos.</p></div> : items.length === 0 ? <div className="empty-state"><span>☝</span><strong>No encontramos productos</strong><p>Prueba otra búsqueda o agrega un producto a tu menú.</p></div> : <div className="menu-grid">{items.map((item) => <article className={`menu-card ${!item.available ? 'unavailable' : ''}`} key={item.id}><div className="menu-card-image"><img src={item.image || 'https://images.unsplash.com/photo-1546549032-9571cd6b27df?auto=format&fit=crop&w=800&q=85'} alt={item.name} /><span className={`availability ${item.available ? '' : 'off'}`}><i />{item.available ? 'Disponible' : 'No disponible'}</span><div className="card-actions"><button title="Editar producto" aria-label={`Editar ${item.name}`} onClick={() => onEdit(item)}><Icon name="edit" size={16} /></button><button title="Eliminar producto" aria-label={`Eliminar ${item.name}`} onClick={() => onDelete(item)}><Icon name="trash" size={16} /></button></div></div><div className="menu-card-body"><span className="product-category">{item.category}</span><div className="menu-card-title"><h3>{item.name}</h3><strong>{money(item.price)}</strong></div><p>{item.description}</p></div></article>)}</div>}
+      {menusLoading || orderItemsLoading || loading ? <div className="empty-state">Cargando menú...</div> : menus.length === 0 ? <div className="empty-state"><span>☝</span><strong>Este restaurante aún no tiene un menú</strong><p>Crea el menú principal para empezar a agregar productos.</p></div> : items.length === 0 ? <div className="empty-state"><span>☝</span><strong>No encontramos productos</strong><p>Prueba otra búsqueda o agrega un producto a tu menú.</p></div> : <div className="menu-grid">{items.map((item) => <article className={`menu-card ${!item.available ? 'unavailable' : ''}`} key={item.id}><div className="menu-card-image"><img src={item.image || FALLBACK_IMAGE} alt={item.name} loading="lazy" decoding="async" onError={handleImageError} /><span className={`availability ${item.available ? '' : 'off'}`}><i />{item.available ? 'Disponible' : 'No disponible'}</span><div className="card-actions"><button title="Editar producto" aria-label={`Editar ${item.name}`} onClick={() => onEdit(item)}><Icon name="edit" size={16} /></button><button title="Eliminar producto" aria-label={`Eliminar ${item.name}`} onClick={() => onDelete(item)}><Icon name="trash" size={16} /></button></div></div><div className="menu-card-body"><span className="product-category">{item.category}</span><div className="menu-card-title"><h3>{item.name}</h3><strong>{money(item.price)}</strong></div><p>{item.description}</p></div></article>)}</div>}
       <div className="menu-footer"><span>{items.length} productos en esta categoría</span><span>Los cambios se guardan automáticamente</span></div>
     </section>
   </>;
@@ -1210,16 +1257,18 @@ function MenuPage({ items, loading, menusLoading, orderItemsLoading, categories,
 
 // Vista operativa de pedidos activos e historial reciente.
 function OrdersPage({ orders, onAdvance, onPrintKitchen, onEdit, pendingOrderIds, onRefresh, onCreate, onRequestPayment, onPrintReceipt, tableActionPending, receiptError, products, productsLoading, countdown, setCountdown, countdownBusy, countdownError }) {
-  const active = orders.filter((order) => order.status !== 'Entregado' && order.status !== 'Pagado');
-  const pendingPayment = orders.filter((order) => order.status === 'Entregado');
-  const paymentGroupsByTable = pendingPayment.reduce((groups, order) => {
-    const group = groups.get(order.table) || { table: order.table, orders: [], total: 0 };
-    group.orders.push(order);
-    group.total += order.total;
-    groups.set(order.table, group);
-    return groups;
-  }, new Map());
-  const paymentGroups = Array.from(paymentGroupsByTable.values()).sort((a, b) => a.table - b.table);
+  const active = useMemo(() => orders.filter((order) => order.status !== 'Entregado' && order.status !== 'Pagado'), [orders]);
+  const paymentGroups = useMemo(() => {
+    const groups = new Map();
+    for (const order of orders) {
+      if (order.status !== 'Entregado') continue;
+      const group = groups.get(order.table) || { table: order.table, orders: [], total: 0 };
+      group.orders.push(order);
+      group.total += order.total;
+      groups.set(order.table, group);
+    }
+    return Array.from(groups.values()).sort((a, b) => a.table - b.table);
+  }, [orders]);
   const canCreate = products.some((item) => item.available);
   return <>
     <PageHeading eyebrow="SERVICIO EN SALÓN" title="Pedidos del restaurante" description="Sigue cada pedido y mantén a tu equipo sincronizado.">
@@ -1233,7 +1282,7 @@ function OrdersPage({ orders, onAdvance, onPrintKitchen, onEdit, pendingOrderIds
     <div className="orders-grid">{active.map((order) => <OrderCard key={order.id} order={order} onAdvance={onAdvance} onPrintKitchen={onPrintKitchen} onEdit={onEdit} pending={pendingOrderIds.includes(order.id)} productsLoading={productsLoading} />)}</div>
     {receiptError && <div className="form-error" role="alert">{receiptError}</div>}
     {paymentGroups.length > 0 && <><div className="orders-toolbar payment-orders-heading"><div><h2>Mesas por pagar <span>{paymentGroups.length}</span></h2><p>Los pedidos entregados de cada mesa se cobran juntos en un solo total</p></div></div><div className="orders-grid">{paymentGroups.map((group) => <TablePaymentCard key={group.table} group={group} onPay={() => onRequestPayment(group)} onPrint={() => onPrintReceipt(group)} disabled={tableActionPending} />)}</div></>}
-    {active.length === 0 && pendingPayment.length === 0 && <div className="panel empty-state"><span>✓</span><strong>¡Todo al día!</strong><p>No hay pedidos pendientes por ahora.</p></div>}
+    {active.length === 0 && paymentGroups.length === 0 && <div className="panel empty-state"><span>✓</span><strong>¡Todo al día!</strong><p>No hay pedidos pendientes por ahora.</p></div>}
     <section className="recent-orders-table panel"><div className="panel-header"><div><h2>Actividad reciente</h2><p>Historial de pedidos recibidos</p></div></div><div className="table-scroll"><table><thead><tr><th>PEDIDO</th><th>MESA</th><th>GARZÓN</th><th>HORA</th><th>ESTADO</th><th>TOTAL</th></tr></thead><tbody>{orders.map((order) => <tr key={order.id}><td className="table-order-id">{order.displayId}</td><td>Mesa {order.table}</td><td>{order.server}</td><td>{order.time}</td><td><span className={`order-status ${statusClass(order.status)}`}>{order.status}</span></td><td><strong>{money(order.total)}</strong></td></tr>)}</tbody></table></div></section>
   </>;
 }
@@ -1538,8 +1587,8 @@ function BusinessPage({ orders, totalSales }) {
     const keys = new Set([monthKey(new Date()), ...orders.map((order) => monthKey(new Date(order.createdAt)))]);
     return [...keys].sort().reverse().map((key) => ({ key, label: monthLabel(key) }));
   }, [orders]);
-  const monthOrders = orders.filter((order) => monthKey(new Date(order.createdAt)) === selectedMonth);
-  const monthTotal = monthOrders.reduce((total, order) => total + order.total, 0);
+  const monthOrders = useMemo(() => orders.filter((order) => monthKey(new Date(order.createdAt)) === selectedMonth), [orders, selectedMonth]);
+  const monthTotal = useMemo(() => monthOrders.reduce((total, order) => total + order.total, 0), [monthOrders]);
 
   return <>
     <PageHeading eyebrow="PANEL ADMINISTRATIVO" title="Gestión de negocio" description="Resumen basado en los pedidos registrados en el backend." />

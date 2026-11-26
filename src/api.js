@@ -9,16 +9,45 @@ export function clearSession() {
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
-async function request(path, { method = 'GET', body, authenticated = true } = {}) {
+const REQUEST_TIMEOUT_MS = 20000;
+const TIMEOUT_MESSAGE = 'La solicitud tardó demasiado. Revisa tu conexión.';
+
+async function request(path, { method = 'GET', body, authenticated = true, signal } = {}) {
   const headers = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const token = authenticated ? getAccessToken() : null;
   if (token) headers.Authorization = `Bearer ${token}`;
 
+  // Controlador propio: distingue timeout (mensaje en español) de cancelación del llamador (AbortError original).
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  const onExternalAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) onExternalAbort();
+    else signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+
+  try {
+    return await performRequest(path, { method, headers, body, token, controller });
+  } catch (error) {
+    if (timedOut && error?.name === 'AbortError') throw new Error(TIMEOUT_MESSAGE);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
+  }
+}
+
+async function performRequest(path, { method, headers, body, token, controller }) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: controller.signal,
   });
 
   if (response.status === 401 && token) {
@@ -161,8 +190,8 @@ export function closeCashRegister(idRestaurante) {
   });
 }
 
-export function getMenus(idRestaurante) {
-  return request(`/restaurantes/${idRestaurante}/menus`);
+export function getMenus(idRestaurante, { signal } = {}) {
+  return request(`/restaurantes/${idRestaurante}/menus`, { signal });
 }
 
 export function createMenu(idRestaurante, nombre) {
@@ -172,8 +201,8 @@ export function createMenu(idRestaurante, nombre) {
   });
 }
 
-export async function getMenu(idMenu) {
-  const items = await request(`/menus/${idMenu}/items`);
+export async function getMenu(idMenu, { signal } = {}) {
+  const items = await request(`/menus/${idMenu}/items`, { signal });
   return items.map(mapMenuItem);
 }
 
@@ -198,13 +227,13 @@ export function deleteMenuItem(idMenu, idItem) {
   return request(`/menus/${idMenu}/items/${idItem}`, { method: 'DELETE' });
 }
 
-export async function getOrders(idRestaurante) {
-  const orders = await request(`/restaurantes/${idRestaurante}/pedidos`);
+export async function getOrders(idRestaurante, { signal } = {}) {
+  const orders = await request(`/restaurantes/${idRestaurante}/pedidos`, { signal });
   return orders.map(mapOrder).sort((a, b) => b.createdAt - a.createdAt);
 }
 
-export async function getOrder(idRestaurante, idPedido) {
-  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${idPedido}`);
+export async function getOrder(idRestaurante, idPedido, { signal } = {}) {
+  const result = await request(`/restaurantes/${idRestaurante}/pedidos/${idPedido}`, { signal });
   return mapOrder(result);
 }
 

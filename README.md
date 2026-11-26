@@ -27,6 +27,12 @@ VITE_API_URL=http://localhost:8082/api
 
 Para probar el entorno local, inicia sesión con el usuario demo `admin` y la contraseña `AdminDemo2026!`.
 
+Para ejecutar las pruebas unitarias:
+
+```bash
+npm test
+```
+
 Para generar y previsualizar la versión de producción:
 
 ```bash
